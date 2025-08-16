@@ -1,47 +1,68 @@
-from flask import Flask, request, jsonify
+# app.py
+from flask import Flask, request, jsonify, abort
 from collections import deque
-from datetime import datetime
+import os, time
 
 app = Flask(__name__)
-LAST = deque(maxlen=1000)
 
-@app.route("/", methods=["GET"])
+# Token opzionale: imposta API_TOKEN nelle Environment Variables su Render
+SECRET_TOKEN = os.getenv("API_TOKEN", "")
+
+# Storage in memoria (demo/POC)
+buffer = deque(maxlen=2000)   # ultime ~2000 misure
+last_item = None
+
+def check_auth():
+    """Se API_TOKEN è definito, richiede header: Authorization: Bearer <token>"""
+    if not SECRET_TOKEN:
+        return True
+    return request.headers.get("Authorization", "") == f"Bearer {SECRET_TOKEN}"
+
+# --- Healthcheck / home ---
+@app.get("/")
 def home():
-    rows = []
-    for x in list(LAST)[-50:]:
-        rows.append(
-            f"<tr><td>{x.get('server_ts','')}</td>"
-            f"<td>{x.get('t_c','')}</td>"
-            f"<td>{x.get('rh','')}</td>"
-            f"<td>{x.get('p_bar','')}</td>"
-            f"<td>{x.get('gas_ohm','')}</td>"
-            f"<td>{x.get('ms','')}</td></tr>"
-        )
-    return f"""
-    <html><head><meta charset="utf-8"><title>ESP32 BME680</title>
-    <style>body{{font-family:sans-serif;margin:24px}}
-    table{{border-collapse:collapse;width:100%}}
-    th,td{{border:1px solid #ccc;padding:6px;text-align:left}}
-    th{{background:#f4f4f4}}</style></head><body>
-      <h1>Ultimi campioni ({len(LAST)})</h1>
-      <table>
-        <thead><tr><th>server_ts</th><th>T (°C)</th><th>RH (%)</th><th>P (bar)</th><th>Gas (Ω)</th><th>ms</th></tr></thead>
-        <tbody>{''.join(rows) or '<tr><td colspan=6>Nessun dato ancora</td></tr>'}</tbody>
-      </table>
-      <p>API JSON: <a href="/last">/last</a></p>
-    </body></html>
-    """, 200
+    return "OK", 200
 
-@app.route("/ingest", methods=["POST"])
+# --- Ingest: l’ESP32 fa POST qui. GET è solo diagnostica veloce ---
+@app.route("/ingest", methods=["POST", "GET"])
 def ingest():
-    obj = (request.get_json(force=True, silent=False) or {})
-    obj["server_ts"] = datetime.utcnow().isoformat() + "Z"
-    LAST.append(obj)
-    # *** QUESTO è ciò che vuoi vedere nei log ***
-    print(obj, flush=True)
-    return jsonify({"status": "ok"}), 200
+    global last_item
+    if request.method == "GET":
+        return jsonify(ok=True, count=len(buffer)), 200
 
-@app.route("/last", methods=["GET"])
-def last():
-    return jsonify(list(LAST)[-50:]), 200
+    # POST: prova JSON, altrimenti cade su testo grezzo
+    item = request.get_json(silent=True)
+    if item is None:
+        raw = request.data.decode("utf-8", "ignore")
+        if not raw:
+            return jsonify(ok=False, error="empty body"), 400
+        item = {"line": raw}
+
+    # aggiungi timestamp server, salva in RAM e logga
+    item["ts"] = int(time.time())
+    buffer.append(item)
+    last_item = item
+    print({"ingest": item}, flush=True)  # visibile nei Logs di Render
+
+    return jsonify(ok=True), 200
+
+# --- API di lettura per client (Qt/QML, ecc.) ---
+@app.get("/api/last")
+def api_last():
+    if not check_auth():
+        abort(401)
+    if not last_item:
+        return jsonify(None), 204
+    return jsonify(last_item)
+
+@app.get("/api/history")
+def api_history():
+    if not check_auth():
+        abort(401)
+    try:
+        limit = min(1000, max(1, int(request.args.get("limit", 100))))
+    except:
+        limit = 100
+    data = list(buffer)[-limit:]
+    return jsonify(data)
 
